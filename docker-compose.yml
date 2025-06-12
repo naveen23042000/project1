@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  reacttestapp:
+    build: .
+    ports:
+      - "80:80"
+    container_name: reacttestapp-container
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
