@@ -5,8 +5,8 @@ set -e
 echo "🚀 Starting deployment process..."
 
 # Variables
-CONTAINER_NAME="reacttestapp-container"
-IMAGE_NAME="reacttestapp"  # Changed to match build.sh
+CONTAINER_NAME="project1-container"
+IMAGE_NAME="project1"
 DOCKER_HUB_USERNAME="naveenkumar492"
 PORT="${DEPLOY_PORT:-80}"  # Allow port override via environment variable
 

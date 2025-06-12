@@ -6,7 +6,7 @@ set -e
 echo "🚀 Starting Docker build process..."
 
 # Variables
-IMAGE_NAME="reacttestapp"
+IMAGE_NAME="project1"
 DEV_TAG="dev"
 PROD_TAG="prod"
 DOCKER_HUB_USERNAME="naveenkumar492"
