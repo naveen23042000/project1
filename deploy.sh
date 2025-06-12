@@ -30,24 +30,20 @@ check_port() {
     # Check using multiple methods for better reliability
     if command -v lsof >/dev/null 2>&1; then
         if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
-            echo "⚠️  Port $port is already in use (detected by lsof)"
             return 1
         fi
     elif command -v netstat >/dev/null 2>&1; then
         if netstat -tuln | grep -q ":$port "; then
-            echo "⚠️  Port $port is already in use (detected by netstat)"
             return 1
         fi
     elif command -v ss >/dev/null 2>&1; then
         if ss -tuln | grep -q ":$port "; then
-            echo "⚠️  Port $port is already in use (detected by ss)"
             return 1
         fi
     fi
     
     # Also check if any Docker container is using this port
     if docker ps --format "{{.Ports}}" | grep -q ":$port->"; then
-        echo "⚠️  Port $port is already in use by another Docker container"
         return 1
     fi
     
@@ -68,7 +64,6 @@ find_available_port() {
         current_port=$((current_port + 1))
     done
     
-    echo "❌ Could not find available port starting from $start_port"
     return 1
 }
 
@@ -114,9 +109,10 @@ docker container prune -f >/dev/null 2>&1 || true
 # Check and handle port availability
 echo "🔍 Checking port availability..."
 if ! check_port $PORT; then
+    echo "⚠️ Port $PORT is already in use"
     echo "🔧 Port $PORT is not available, trying to find an alternative..."
     AVAILABLE_PORT=$(find_available_port $PORT)
-    if [ $? -eq 0 ]; then
+    if [ $? -eq 0 ] && [ ! -z "$AVAILABLE_PORT" ]; then
         PORT=$AVAILABLE_PORT
         echo "✅ Using alternative port: $PORT"
     else
