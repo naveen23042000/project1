@@ -8,7 +8,7 @@ echo "🚀 Starting deployment process..."
 CONTAINER_NAME="project1-container"
 IMAGE_NAME="project1"
 DOCKER_HUB_USERNAME="naveenkumar492"
-PORT="${DEPLOY_PORT:-80}"  # Allow port override via environment variable
+PORT="${DEPLOY_PORT:-8080}"  # Changed default port to 8080 to avoid conflicts
 
 # Get current git branch - handle Jenkins environment
 if [ -n "$BRANCH_NAME" ]; then
@@ -27,11 +27,49 @@ echo "Current branch: $BRANCH"
 # Function to check if port is available
 check_port() {
     local port=$1
-    if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
-        echo "⚠️  Port $port is already in use"
+    # Check using multiple methods for better reliability
+    if command -v lsof >/dev/null 2>&1; then
+        if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+            echo "⚠️  Port $port is already in use (detected by lsof)"
+            return 1
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -tuln | grep -q ":$port "; then
+            echo "⚠️  Port $port is already in use (detected by netstat)"
+            return 1
+        fi
+    elif command -v ss >/dev/null 2>&1; then
+        if ss -tuln | grep -q ":$port "; then
+            echo "⚠️  Port $port is already in use (detected by ss)"
+            return 1
+        fi
+    fi
+    
+    # Also check if any Docker container is using this port
+    if docker ps --format "{{.Ports}}" | grep -q ":$port->"; then
+        echo "⚠️  Port $port is already in use by another Docker container"
         return 1
     fi
+    
     return 0
+}
+
+# Function to find available port
+find_available_port() {
+    local start_port=$1
+    local max_attempts=20
+    local current_port=$start_port
+    
+    for ((i=0; i<max_attempts; i++)); do
+        if check_port $current_port; then
+            echo $current_port
+            return 0
+        fi
+        current_port=$((current_port + 1))
+    done
+    
+    echo "❌ Could not find available port starting from $start_port"
+    return 1
 }
 
 # Function to wait for container to be healthy
@@ -55,22 +93,58 @@ wait_for_container() {
     return 1
 }
 
-# Stop and remove existing container
+# Stop and remove existing container - improved cleanup
 echo "🛑 Cleaning up existing deployment..."
+# Stop container if running
 if docker ps -q --filter "name=$CONTAINER_NAME" | grep -q .; then
     echo "Stopping existing container..."
     docker stop $CONTAINER_NAME 2>/dev/null || true
+    sleep 2  # Give it time to stop
 fi
 
+# Remove container if exists
 if docker ps -aq --filter "name=$CONTAINER_NAME" | grep -q .; then
     echo "Removing existing container..."
     docker rm $CONTAINER_NAME 2>/dev/null || true
 fi
 
-# Check if port is available
+# Remove any dangling containers with the same name pattern
+docker container prune -f >/dev/null 2>&1 || true
+
+# Check and handle port availability
+echo "🔍 Checking port availability..."
 if ! check_port $PORT; then
-    echo "❌ Port $PORT is not available. Please stop the service using this port or change DEPLOY_PORT."
-    exit 1
+    echo "🔧 Port $PORT is not available, trying to find an alternative..."
+    AVAILABLE_PORT=$(find_available_port $PORT)
+    if [ $? -eq 0 ]; then
+        PORT=$AVAILABLE_PORT
+        echo "✅ Using alternative port: $PORT"
+    else
+        echo "❌ Could not find available port. Trying to force cleanup..."
+        
+        # Try to force stop any container using the port
+        CONFLICTING_CONTAINER=$(docker ps --filter "publish=$PORT" --quiet)
+        if [ ! -z "$CONFLICTING_CONTAINER" ]; then
+            echo "🛑 Force stopping container using port $PORT..."
+            docker stop $CONFLICTING_CONTAINER || true
+            docker rm $CONFLICTING_CONTAINER || true
+            sleep 3
+            
+            # Check again
+            if check_port $PORT; then
+                echo "✅ Port $PORT is now available"
+            else
+                echo "❌ Port $PORT is still not available. Please manually check what's using this port."
+                exit 1
+            fi
+        else
+            echo "❌ Port $PORT is not available and no Docker container conflict detected."
+            echo "Please check what system service is using port $PORT or set DEPLOY_PORT environment variable."
+            exit 1
+        fi
+    fi
+else
+    echo "✅ Port $PORT is available"
 fi
 
 # Deploy based on branch
@@ -78,22 +152,10 @@ echo "🚀 Starting new deployment..."
 if [ "$BRANCH" = "dev" ]; then
     echo "Deploying dev version..."
     IMAGE_TO_DEPLOY="$DOCKER_HUB_USERNAME/dev:dev"
-    docker run -d \
-        --name $CONTAINER_NAME \
-        -p $PORT:80 \
-        --restart unless-stopped \
-        $IMAGE_TO_DEPLOY
-    echo "📦 Deployed image: $IMAGE_TO_DEPLOY"
     
 elif [ "$BRANCH" = "master" ] || [ "$BRANCH" = "main" ]; then
     echo "Deploying production version..."
     IMAGE_TO_DEPLOY="$DOCKER_HUB_USERNAME/prod:prod"
-    docker run -d \
-        --name $CONTAINER_NAME \
-        -p $PORT:80 \
-        --restart unless-stopped \
-        $IMAGE_TO_DEPLOY
-    echo "📦 Deployed image: $IMAGE_TO_DEPLOY"
     
 else
     echo "Deploying feature branch version..."
@@ -102,19 +164,33 @@ else
     IMAGE_TO_DEPLOY="$DOCKER_HUB_USERNAME/dev:$SAFE_BRANCH"
     
     # Check if the feature branch image exists, fallback to latest if not
-    if docker image inspect $IMAGE_TO_DEPLOY >/dev/null 2>&1; then
-        echo "Using feature branch image: $IMAGE_TO_DEPLOY"
-    else
+    if ! docker image inspect $IMAGE_TO_DEPLOY >/dev/null 2>&1; then
         echo "Feature branch image not found, using local latest image..."
         IMAGE_TO_DEPLOY="$IMAGE_NAME:latest"
     fi
-    
-    docker run -d \
-        --name $CONTAINER_NAME \
-        -p $PORT:80 \
-        --restart unless-stopped \
-        $IMAGE_TO_DEPLOY
-    echo "📦 Deployed image: $IMAGE_TO_DEPLOY"
+fi
+
+echo "📦 Deploying image: $IMAGE_TO_DEPLOY"
+
+# Try to pull the image first (if it's from Docker Hub)
+if [[ $IMAGE_TO_DEPLOY == *"$DOCKER_HUB_USERNAME"* ]]; then
+    echo "📥 Pulling latest image..."
+    docker pull $IMAGE_TO_DEPLOY || echo "⚠️  Could not pull image, using local version"
+fi
+
+# Deploy the container
+echo "🚀 Starting container..."
+CONTAINER_ID=$(docker run -d \
+    --name $CONTAINER_NAME \
+    -p $PORT:80 \
+    --restart unless-stopped \
+    $IMAGE_TO_DEPLOY)
+
+if [ $? -eq 0 ]; then
+    echo "✅ Container started with ID: ${CONTAINER_ID:0:12}"
+else
+    echo "❌ Failed to start container"
+    exit 1
 fi
 
 # Wait for container to be ready
@@ -139,11 +215,14 @@ if wait_for_container $CONTAINER_NAME; then
     echo ""
     echo "🧪 Testing application response..."
     if command -v curl >/dev/null 2>&1; then
-        sleep 3
-        if curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT | grep -q "200"; then
+        sleep 5  # Give more time for the app to start
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT 2>/dev/null || echo "000")
+        if [ "$HTTP_STATUS" = "200" ]; then
             echo "✅ Application is responding successfully!"
+        elif [ "$HTTP_STATUS" = "000" ]; then
+            echo "⚠️  Could not connect to application (connection refused)"
         else
-            echo "⚠️  Application may not be fully ready yet (this is normal for React apps)"
+            echo "⚠️  Application returned HTTP status: $HTTP_STATUS"
         fi
     else
         echo "ℹ️  curl not available, skipping response test"
@@ -162,3 +241,4 @@ fi
 
 echo ""
 echo "🎉 Deployment completed successfully!"
+echo "🌐 Access your application at: http://localhost:$PORT"
